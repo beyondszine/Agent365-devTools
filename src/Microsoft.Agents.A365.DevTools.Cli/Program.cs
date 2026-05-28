@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Microsoft.Agents.A365.DevTools.Cli.Commands;
+using Microsoft.Agents.A365.DevTools.Cli.Constants;
 using Microsoft.Agents.A365.DevTools.Cli.Exceptions;
 using Microsoft.Agents.A365.DevTools.Cli.Services;
 using Microsoft.Agents.A365.DevTools.Cli.Services.Helpers;
@@ -182,6 +183,8 @@ class Program
             var logsLogger = serviceProvider.GetRequiredService<ILogger<LogsCommand>>();
             var logRedactionService = serviceProvider.GetRequiredService<ILogRedactionService>();
             rootCommand.AddCommand(LogsCommand.CreateCommand(logsLogger, logRedactionService));
+            var authCacheLogger = serviceProvider.GetRequiredService<ILogger<AuthCacheCommand>>();
+            rootCommand.AddCommand(AuthCacheCommand.CreateCommand(authCacheLogger));
 
             // Build pipeline manually so we can skip UseTypoCorrections() ("Did you mean?" noise)
             // and UseParseErrorReporting() (full help dump on any parse error), replacing both
@@ -247,7 +250,8 @@ class Program
                 || args.Any(a => a is "--help" or "-h" or "--version");
             var isShowSecret = args.Any(a => a.Equals("--show-secret", StringComparison.Ordinal)
                 || a.StartsWith("--show-secret=", StringComparison.Ordinal));
-            if (!isHelpOrVersion && !isShowSecret)
+            var isAuthCacheCommand = args.FirstOrDefault(arg => !arg.StartsWith("-")) == CommandNames.AuthCache;
+            if (!isHelpOrVersion && !isShowSecret && !isAuthCacheCommand)
             {
                 try
                 {

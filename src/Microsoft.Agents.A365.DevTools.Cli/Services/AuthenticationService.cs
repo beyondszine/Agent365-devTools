@@ -43,7 +43,7 @@ public interface IAuthenticationService
 /// - Typical user experience: 1-2 authentication prompts for entire CLI workflow
 ///
 /// TOKEN CACHING:
-/// - Cache Location: %LocalApplicationData%\Agent365\token-cache.json (Windows)
+/// - Cache Location: %LocalApplicationData%\Microsoft.Agents.A365.DevTools.Cli\auth-token.json (Windows)
 /// - Cache Key Format: {resourceUrl}:tenant:{tenantId}[:user:{userId}]
 /// - Cache Expiration: Validated with 5-minute buffer before token expiry
 /// - Reuse Across Commands: All CLI commands share the same token cache
