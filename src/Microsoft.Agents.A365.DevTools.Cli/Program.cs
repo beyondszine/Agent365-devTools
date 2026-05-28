@@ -12,6 +12,7 @@ using System.CommandLine.Builder;
 using System.CommandLine.Invocation;
 using System.CommandLine.Parsing;
 using System.Reflection;
+using System.Text.Json;
 
 namespace Microsoft.Agents.A365.DevTools.Cli;
 
@@ -249,6 +250,8 @@ class Program
                 || a.StartsWith("--show-secret=", StringComparison.Ordinal));
             if (!isHelpOrVersion && !isShowSecret)
             {
+                await LogExecutionContextAsync(startupLogger, executor, args);
+
                 try
                 {
                     await configService.TryResolveClientAppIdAsync(graphApiService);
@@ -394,7 +397,7 @@ class Program
 
         // Register Azure CLI service
         services.AddSingleton<IAzureCliService, AzureCliService>();
-        
+
         // Register confirmation provider for user prompts
         services.AddSingleton<IConfirmationProvider, ConsoleConfirmationProvider>();
 
@@ -410,6 +413,159 @@ class Program
 
         // Fallback: AssemblyVersion if InformationalVersion is missing
         return infoVer ?? asm.GetName().Version?.ToString() ?? "unknown";
+    }
+
+    private static async Task LogExecutionContextAsync(ILogger logger, CommandExecutor executor, string[] args)
+    {
+        logger.LogInformation("");
+        logger.LogInformation("Execution context");
+        logger.LogInformation("  Command: a365 {Arguments}", string.Join(" ", args));
+
+        var azureContext = await TryGetAzureContextAsync(logger, executor);
+        if (azureContext is null)
+        {
+            logger.LogInformation("  Azure CLI: not signed in or unavailable");
+        }
+        else
+        {
+            logger.LogInformation("  User: {User}", azureContext.User ?? "(unknown)");
+            logger.LogInformation("  Tenant: {Tenant}", FormatNameAndId(azureContext.TenantName, azureContext.TenantId));
+            logger.LogInformation("  Subscription: {Subscription}", FormatNameAndId(azureContext.SubscriptionName, azureContext.SubscriptionId));
+        }
+
+        var configPath = ResolveConfigPath(args);
+        if (File.Exists(configPath))
+        {
+            var configContext = await TryGetConfigContextAsync(logger, configPath);
+            logger.LogInformation("  Config: {ConfigPath}", configPath);
+            if (configContext is not null)
+            {
+                logger.LogInformation("  Config tenant: {TenantId}", configContext.TenantId ?? "(not set)");
+                logger.LogInformation("  Environment: {Environment}", configContext.Environment ?? "prod");
+                logger.LogInformation("  Agent identity: {AgentIdentity}", configContext.AgentIdentityDisplayName ?? "(not set)");
+            }
+        }
+        else
+        {
+            logger.LogInformation("  Config: not found ({ConfigPath})", configPath);
+        }
+
+        logger.LogInformation("");
+    }
+
+    private static async Task<CliAzureContext?> TryGetAzureContextAsync(ILogger logger, CommandExecutor executor)
+    {
+        try
+        {
+            var result = await executor.ExecuteAsync("az", "account show --output json", suppressErrorLogging: true);
+            if (!result.Success || string.IsNullOrWhiteSpace(result.StandardOutput))
+                return null;
+
+            using var doc = JsonDocument.Parse(result.StandardOutput);
+            var root = doc.RootElement;
+            var tenantId = TryGetString(root, "tenantId");
+            var tenantName = TryGetString(root, "tenantDisplayName") ?? await TryGetTenantDisplayNameAsync(logger, executor, tenantId);
+
+            string? user = null;
+            if (root.TryGetProperty("user", out var userElement))
+                user = TryGetString(userElement, "name");
+
+            return new CliAzureContext(
+                user,
+                tenantId,
+                tenantName,
+                TryGetString(root, "id"),
+                TryGetString(root, "name"));
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Failed to resolve Azure CLI execution context");
+            return null;
+        }
+    }
+
+    private static async Task<string?> TryGetTenantDisplayNameAsync(ILogger logger, CommandExecutor executor, string? tenantId)
+    {
+        if (string.IsNullOrWhiteSpace(tenantId))
+            return null;
+
+        try
+        {
+            var result = await executor.ExecuteAsync("az", "account tenant list --output json", suppressErrorLogging: true);
+            if (!result.Success || string.IsNullOrWhiteSpace(result.StandardOutput))
+                return null;
+
+            using var doc = JsonDocument.Parse(result.StandardOutput);
+            foreach (var tenant in doc.RootElement.EnumerateArray())
+            {
+                if (string.Equals(TryGetString(tenant, "tenantId"), tenantId, StringComparison.OrdinalIgnoreCase))
+                    return TryGetString(tenant, "displayName");
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Failed to resolve tenant display name from Azure CLI");
+            return null;
+        }
+    }
+
+    private static async Task<CliConfigContext?> TryGetConfigContextAsync(ILogger logger, string configPath)
+    {
+        try
+        {
+            var json = await File.ReadAllTextAsync(configPath);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            return new CliConfigContext(
+                TryGetString(root, "tenantId"),
+                TryGetString(root, "environment"),
+                TryGetString(root, "agentIdentityDisplayName"));
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Failed to read execution context from config file {ConfigPath}", configPath);
+            return null;
+        }
+    }
+
+    private static string ResolveConfigPath(string[] args)
+    {
+        for (var i = 0; i < args.Length; i++)
+        {
+            if ((args[i] == "--config" || args[i] == "-c") && i < args.Length - 1)
+                return ResolvePath(args[i + 1]);
+
+            const string configPrefix = "--config=";
+            if (args[i].StartsWith(configPrefix, StringComparison.Ordinal))
+                return ResolvePath(args[i][configPrefix.Length..]);
+        }
+
+        return ResolvePath("a365.config.json");
+    }
+
+    private static string ResolvePath(string path)
+    {
+        return Path.IsPathRooted(path)
+            ? path
+            : Path.Combine(Environment.CurrentDirectory, path);
+    }
+
+    private static string FormatNameAndId(string? name, string? id)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return string.IsNullOrWhiteSpace(id) ? "(unknown)" : id;
+        if (string.IsNullOrWhiteSpace(id))
+            return name;
+        return $"{name} ({id})";
+    }
+
+    private static string? TryGetString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
     }
 
     /// <summary>
@@ -433,5 +589,17 @@ class Program
             .Replace(" ", "-")
             .Replace("_", "-");
     }
+
+    private sealed record CliAzureContext(
+        string? User,
+        string? TenantId,
+        string? TenantName,
+        string? SubscriptionId,
+        string? SubscriptionName);
+
+    private sealed record CliConfigContext(
+        string? TenantId,
+        string? Environment,
+        string? AgentIdentityDisplayName);
 }
 
