@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 using Microsoft.Agents.A365.DevTools.Cli.Commands;
+using Microsoft.Agents.A365.DevTools.Cli.Constants;
 using Microsoft.Agents.A365.DevTools.Cli.Exceptions;
+using Microsoft.Agents.A365.DevTools.Cli.Helpers;
 using Microsoft.Agents.A365.DevTools.Cli.Services;
 using Microsoft.Agents.A365.DevTools.Cli.Services.Helpers;
 using Microsoft.Extensions.DependencyInjection;
@@ -33,8 +35,7 @@ class Program
         {
             try
             {
-                // args are CLI arguments only — no secrets are passed as args (API keys, passwords are read from config/env).
-                var commandLine = "a365 " + string.Join(" ", args);
+                var commandLine = CommandStringHelper.FormatForDisplay("a365", args);
                 var separator =
                     Environment.NewLine +
                     "============================================================" + Environment.NewLine +
@@ -333,35 +334,28 @@ class Program
             string environment = Environment.GetEnvironmentVariable("A365_ENVIRONMENT") ?? "prod";
 
             var args = Environment.GetCommandLineArgs();
-            var configIndex = Array.FindIndex(args, arg => arg == "--config" || arg == "-c");
-            if (configIndex >= 0 && configIndex < args.Length - 1)
+            var configFilePath = ResolveConfigPath(args);
+            try
             {
-                try
+                if (File.Exists(configFilePath))
                 {
-                    var configFilePath = args[configIndex + 1];
-                    if (!Path.IsPathRooted(configFilePath))
-                        configFilePath = Path.Combine(System.Environment.CurrentDirectory, configFilePath);
-
-                    if (File.Exists(configFilePath))
+                    var json = File.ReadAllText(configFilePath);
+                    using var doc = System.Text.Json.JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("environment", out var envProp))
                     {
-                        var json = File.ReadAllText(configFilePath);
-                        using var doc = System.Text.Json.JsonDocument.Parse(json);
-                        if (doc.RootElement.TryGetProperty("environment", out var envProp))
+                        var envValue = envProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(envValue))
                         {
-                            var envValue = envProp.GetString();
-                            if (!string.IsNullOrWhiteSpace(envValue))
-                            {
-                                environment = envValue;
-                            }
+                            environment = envValue;
                         }
                     }
 
                     logger.LogDebug("Resolved environment from config: {Environment}", environment);
                 }
-                catch (Exception ex)
-                {
-                    logger.LogDebug("Failed to read environment from config: {Error}", ex.Message);
-                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug("Failed to read environment from config: {Error}", ex.Message);
             }
 
             return new Agent365ToolingService(configService, authService, logger, environment);
@@ -394,7 +388,7 @@ class Program
 
         // Register Azure CLI service
         services.AddSingleton<IAzureCliService, AzureCliService>();
-        
+
         // Register confirmation provider for user prompts
         services.AddSingleton<IConfirmationProvider, ConsoleConfirmationProvider>();
 
@@ -432,6 +426,39 @@ class Program
         return command.ToLowerInvariant()
             .Replace(" ", "-")
             .Replace("_", "-");
+    }
+
+    /// <summary>
+    /// Resolves the absolute path to a365.config.json from CLI arguments.
+    /// Handles both "--config path" and "--config=path" forms.
+    /// Empty or whitespace --config values fall back to the default "a365.config.json"
+    /// in the working directory so diagnostics never report the current directory as a config file.
+    /// </summary>
+    internal static string ResolveConfigPath(string[] args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            string? raw = null;
+
+            if ((args[i] == "--config" || args[i] == "-c") && i < args.Length - 1)
+                raw = args[i + 1];
+            else if (args[i].StartsWith("--config=", StringComparison.Ordinal))
+                raw = args[i]["--config=".Length..];
+
+            if (raw is not null)
+            {
+                if (string.IsNullOrWhiteSpace(raw))
+                    return Path.Combine(Environment.CurrentDirectory, ConfigConstants.DefaultConfigFileName);
+
+                return Path.IsPathRooted(raw)
+                    ? raw
+                    : Path.Combine(Environment.CurrentDirectory, raw);
+            }
+        }
+
+        return Path.Combine(Environment.CurrentDirectory, ConfigConstants.DefaultConfigFileName);
     }
 }
 

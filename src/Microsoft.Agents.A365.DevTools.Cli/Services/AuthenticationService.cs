@@ -63,6 +63,9 @@ public class AuthenticationService : IAuthenticationService
 {
     private readonly ILogger<AuthenticationService> _logger;
     private readonly string _tokenCachePath;
+    private readonly object _authContextLogLock = new();
+    private string? _lastLoggedUser;
+    private string? _lastLoggedTenant;
 
     public AuthenticationService(ILogger<AuthenticationService> logger)
     {
@@ -168,6 +171,7 @@ public class AuthenticationService : IAuthenticationService
                                 }
                                 else
                                 {
+                                    LogAuthenticationContext(cachedToken.AccessToken, cachedToken.TenantId, userId, resourceUrl, fromCache: true);
                                     _logger.LogDebug("Using cached authentication token for {ResourceUrl} (tenant: {TenantId})",
                                         resourceUrl, tenantId);
                                     return cachedToken.AccessToken;
@@ -175,6 +179,7 @@ public class AuthenticationService : IAuthenticationService
                             }
                             else
                             {
+                                LogAuthenticationContext(cachedToken.AccessToken, cachedToken.TenantId, userId, resourceUrl, fromCache: true);
                                 _logger.LogDebug("Using cached authentication token for {ResourceUrl} (tenant: {TenantId})",
                                     resourceUrl, tenantId);
                                 return cachedToken.AccessToken;
@@ -183,6 +188,7 @@ public class AuthenticationService : IAuthenticationService
                     }
                     else
                     {
+                        LogAuthenticationContext(cachedToken.AccessToken, cachedToken.TenantId, userId, resourceUrl, fromCache: true);
                         _logger.LogDebug("Using cached authentication token for {ResourceUrl}", resourceUrl);
                         return cachedToken.AccessToken;
                     }
@@ -212,6 +218,7 @@ public class AuthenticationService : IAuthenticationService
                 _logger.LogDebug(
                     "Authentication returned token for {ReturnedUser} but {RequestedUser} was requested. Not caching.",
                     returnedUpn, userId);
+                LogAuthenticationContext(token.AccessToken, token.TenantId, userId, resourceUrl, fromCache: false);
                 // Return the token as-is — it may still be valid for this call.
                 // Do not write it to cache under the userId key.
                 return token.AccessToken;
@@ -220,6 +227,7 @@ public class AuthenticationService : IAuthenticationService
 
         // Cache the token with the appropriate cache key
         await CacheTokenAsync(cacheKey, token);
+        LogAuthenticationContext(token.AccessToken, token.TenantId, userId, resourceUrl, fromCache: false);
 
         return token.AccessToken;
     }
@@ -686,6 +694,21 @@ public class AuthenticationService : IAuthenticationService
 
     private static string? TryExtractUpnFromJwt(string? jwt)
     {
+        foreach (var claim in new[] { "upn", "preferred_username", "unique_name" })
+        {
+            var value = TryExtractClaimFromJwt(jwt, claim);
+            if (!string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractTenantIdFromJwt(string? jwt)
+        => TryExtractClaimFromJwt(jwt, "tid");
+
+    private static string? TryExtractClaimFromJwt(string? jwt, string claimName)
+    {
         if (string.IsNullOrWhiteSpace(jwt)) return null;
         try
         {
@@ -698,15 +721,52 @@ public class AuthenticationService : IAuthenticationService
             payload = payload.PadRight(payload.Length + (4 - payload.Length % 4) % 4, '=');
             var bytes = Convert.FromBase64String(payload);
             using var doc = JsonDocument.Parse(bytes);
-            if (doc.RootElement.TryGetProperty("upn", out var upn) && !string.IsNullOrWhiteSpace(upn.GetString()))
-                return upn.GetString();
-            if (doc.RootElement.TryGetProperty("preferred_username", out var pref) && !string.IsNullOrWhiteSpace(pref.GetString()))
-                return pref.GetString();
-            if (doc.RootElement.TryGetProperty("unique_name", out var uniqueName) && !string.IsNullOrWhiteSpace(uniqueName.GetString()))
-                return uniqueName.GetString();
+            return doc.RootElement.TryGetProperty(claimName, out var claim) && claim.ValueKind == JsonValueKind.String
+                ? claim.GetString()
+                : null;
         }
-        catch { } // Static helper — no logger access. Caller logs via ResolveLoginHintFromCacheAsync.
+        catch { } // Static helper — no logger access. Callers log when needed.
         return null;
+    }
+
+    private void LogAuthenticationContext(
+        string accessToken,
+        string? fallbackTenantId,
+        string? fallbackUserId,
+        string resourceUrl,
+        bool fromCache)
+    {
+        var user = TryExtractUpnFromJwt(accessToken) ?? fallbackUserId ?? "(unknown)";
+        var tenant = TryExtractTenantIdFromJwt(accessToken) ?? fallbackTenantId ?? "(unknown)";
+
+        var shouldLogContextChange = false;
+        lock (_authContextLogLock)
+        {
+            var changed = !string.Equals(_lastLoggedUser, user, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(_lastLoggedTenant, tenant, StringComparison.OrdinalIgnoreCase);
+
+            if (changed)
+            {
+                _lastLoggedUser = user;
+                _lastLoggedTenant = tenant;
+                shouldLogContextChange = true;
+            }
+        }
+
+        if (shouldLogContextChange)
+        {
+            _logger.LogInformation(
+                "Authentication context: API calls will use user {User} in tenant {TenantId} ({Source})",
+                user,
+                tenant,
+                fromCache ? "cached token" : "interactive sign-in");
+        }
+
+        _logger.LogDebug(
+            "Resolved access token for {ResourceUrl} using user {User} in tenant {TenantId}",
+            resourceUrl,
+            user,
+            tenant);
     }
 
     /// <summary>
